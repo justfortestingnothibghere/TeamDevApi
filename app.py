@@ -19,15 +19,15 @@ SUPABASE_KEY = os.environ.get(
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 BUCKET_NAME = "sites"
 
-# Your new domain
+# Your final domain
 CUSTOM_DOMAIN = "https://teamdevsss.netlify.app"
 
-# Allowed extensions (same safe list)
+# Safe extensions only
 ALLOWED_EXTENSIONS = {
-    '.html', '.htm', '.css', '.js', '.json', '.xml',
+    '.html', '.htm', '.css', '.js', '.json', '.xml', '.txt', '.md',
     '.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg', '.ico',
-    '.txt', '.md', '.woff', '.woff2', '.ttf', '.eot', '.otf',
-    '.mp3', '.wav', '.ogg', '.mp4', '.webm', '.pdf', '.csv',
+    '.woff', '.woff2', '.ttf', '.eot', '.otf',
+    '.mp3', '.wav', '.ogg', '.mp4', '.webm', '.pdf', '.csv'
 }
 
 BLOCKED_EXTENSIONS = {
@@ -49,19 +49,23 @@ def is_safe_path(path):
 def get_mime_type(filename):
     ext = os.path.splitext(filename)[1].lower()
     mime_map = {
-        '.html': 'text/html', '.css': 'text/css', '.js': 'application/javascript',
-        '.json': 'application/json', '.png': 'image/png', '.jpg': 'image/jpeg',
-        '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.svg': 'image/svg+xml',
-        '.webp': 'image/webp', '.ico': 'image/x-icon', '.woff': 'font/woff',
-        '.woff2': 'font/woff2', '.ttf': 'font/ttf',
+        '.html': 'text/html', '.htm': 'text/html',
+        '.css': 'text/css',
+        '.js': 'application/javascript',
+        '.json': 'application/json',
+        '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+        '.gif': 'image/gif', '.webp': 'image/webp', '.svg': 'image/svg+xml',
+        '.ico': 'image/x-icon',
+        '.woff': 'font/woff', '.woff2': 'font/woff2', '.ttf': 'font/ttf',
+        '.pdf': 'application/pdf',
     }
     return mime_map.get(ext, 'application/octet-stream')
 
 @app.route("/upload", methods=["POST"])
 def upload():
     if "file" not in request.files:
-        return jsonify({"error": "No file part"}), 400
-    
+        return jsonify({"error": "No file part in request"}), 400
+
     file = request.files["file"]
     name = request.form.get("name") or str(uuid.uuid4())[:10]
 
@@ -77,14 +81,16 @@ def upload():
     try:
         file.save(zip_path)
 
+        # Validate ZIP contents before extracting
         with zipfile.ZipFile(zip_path, "r") as zip_ref:
             for zip_info in zip_ref.infolist():
-                if zip_info.filename.startswith("/") or ".." in zip_info.filename:
-                    return jsonify({"error": "Path traversal detected in ZIP"}), 400
+                if zip_info.filename.startswith("/") or "../" in zip_info.filename:
+                    return jsonify({"error": "Path traversal detected"}), 400
                 if not is_safe_path(zip_info.filename):
                     ext = os.path.splitext(zip_info.filename)[1].lower()
                     return jsonify({
-                        "error": f"Blocked file: {zip_info.filename}",
+                        "error": "Blocked file type",
+                        "file": zip_info.filename,
                         "reason": f"Extension {ext} not allowed"
                     }), 400
             zip_ref.extractall(temp_dir)
@@ -96,25 +102,27 @@ def upload():
             for f in files:
                 if f == "upload.zip":
                     continue
+
                 local_path = os.path.join(root, f)
                 rel_path = os.path.relpath(local_path, temp_dir)
-                
                 if not is_safe_path(rel_path):
                     continue
 
                 storage_path = f"{name}/{rel_path}".replace("\\", "/")
 
                 with open(local_path, "rb") as f_obj:
-                    res = supabase.storage.from_(BUCKET_NAME).upload(
-                        storage_path,
-                        f_obj,
-                        file_options={"upsert": True, "content-type": get_mime_type(f)}
+                    # THIS IS THE MAIN FIX → "upsert": "true" (string, not bool)
+                    supabase.storage.from_(BUCKET_NAME).upload(
+                        path=storage_path,
+                        file=f_obj,
+                        file_options={
+                            "content-type": get_mime_type(f),
+                            "upsert": "true"          # ← FIXED: string, not True
+                        }
                     )
-                    if res.status_code not in (200, 201):
-                        raise Exception(f"Upload failed: {res.json()}")
 
                 uploaded_files.append(storage_path)
-                if rel_path.lower() == "index.html":
+                if rel_path.lower().endswith("index.html"):
                     index_found = True
 
         public_url = supabase.storage.from_(BUCKET_NAME).get_public_url(f"{name}/index.html")
@@ -122,9 +130,9 @@ def upload():
         return jsonify({
             "success": True,
             "name": name,
-            "url": f"{CUSTOM_DOMAIN}/{name}",           # ← Updated here
-            "public_index": public_url,
-            "uploaded_files_count": len(uploaded_files),
+            "url": f"{CUSTOM_DOMAIN}/{name}",
+            "direct_link": public_url,
+            "files_uploaded": len(uploaded_files),
             "message": "Site deployed successfully!"
         })
 
@@ -132,11 +140,12 @@ def upload():
         return jsonify({"error": "Invalid or corrupted ZIP file"}), 400
     except Exception as e:
         error_detail = traceback.format_exc()
-        print("Upload Error:", error_detail)
+        print("ERROR:", error_detail)
         return jsonify({
             "error": "Deployment failed",
             "details": str(e),
-            "traceback": error_detail   # Remove this line in production if you don't want to expose traceback
+            # Remove traceback in production if you want
+            # "traceback": error_detail
         }), 500
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
@@ -150,7 +159,12 @@ def serve_site(name, filename):
 
 @app.route("/")
 def health():
-    return jsonify({"status": "ok", "service": "teamdevsss.netlify.app Deployer"})
+    return jsonify({
+        "status": "ok",
+        "service": "TeamDevSSS Deployer",
+        "domain": CUSTOM_DOMAIN,
+        "time": "November 12, 2025"
+    })
 
 
 if __name__ == "__main__":
